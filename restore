@@ -221,7 +221,9 @@ function start() {
     echo "  This will take some time on a large database"
     cd $script_path/${PARAMS[archive_path]}/${CFG[archive]}
     echo ""
-    sudo $mysql -Nse 'show tables' ${IOMAD[dbname]} | while read table; do sudo $mysql -e "drop table $table" ${IOMAD[dbname]}; done
+    sudo $mysql -u ${IOMAD[dbuser]} -p${IOMAD[dbpass]} -Nse 'show tables' ${IOMAD[dbname]} | while read table; do
+        sudo $mysql -u ${IOMAD[dbuser]} -p${IOMAD[dbpass]} -e "drop table $table" ${IOMAD[dbname]}
+    done
     sudo $mysql -u ${IOMAD[dbuser]} -p${IOMAD[dbpass]} ${IOMAD[dbname]} < ${PARAMS[database_dump]}
     echo "- Moving archived folders into ${PARAMS[www_rootdir]}/$HOST_DIR/"
     cd $script_path/${PARAMS[archive_path]}/${CFG[archive]}/
