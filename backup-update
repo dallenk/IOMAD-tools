@@ -255,6 +255,7 @@ require_command find
 require_command sort
 require_command tail
 require_command du
+require_command readlink
 require_command tar
 require_command rsync
 require_command mysqldump
@@ -674,6 +675,11 @@ backup_moodledata_snapshot() {
 
     local previous_backup
     previous_backup="$(find_previous_backup || true)"
+
+    # Convert to absolute path so rsync --link-dest resolves correctly
+    if [ -n "$previous_backup" ]; then
+        previous_backup="$(readlink -f "$previous_backup")"
+    fi
 
     local link_dest_args=()
 
