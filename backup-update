@@ -5,16 +5,14 @@
 # Backup layout:
 #   archive_root/host/YYYYMMDD-HHMMSS-gitcommit/
 #     ├── html.tar.gz
-#     ├── moodledata/              <-- rsync snapshot, hardlinked to previous backup
-#     ├── database.sql.gz
+#     ├── moodledata.tar.gz       <-- compressed, excludes runtime directories
+#     ├── database.sql
 #     ├── PARAMS
 #     └── backup-manifest.txt
 #
 # Major changes from the old version:
-#   - Does NOT tar.gz the whole moodledata directory every time.
 #   - Excludes Moodle runtime directories:
 #       cache, localcache, sessions, temp, trashdir, lock
-#   - Uses rsync --link-dest for local incremental snapshots.
 #   - Uses pigz if available, gzip otherwise.
 #   - Uses safer mysqldump options for Moodle/IOMAD.
 #   - Does not print the database password.
@@ -255,7 +253,6 @@ require_command find
 require_command sort
 require_command tail
 require_command du
-require_command readlink
 require_command tar
 require_command rsync
 require_command mysqldump
@@ -563,10 +560,10 @@ archive_root=$(cfg archive_root)
 archive_base=$ARCHIVE_BASE
 archive_path=$ARCHIVE_PATH
 last_backup=$(basename "$ARCHIVE_PATH")
-database_dump=${IOMAD[dbname]}.sql.gz
+database_dump=${IOMAD[dbname]}.sql
 html_archive=$(cfg host_htmlroot).tar.gz
-moodledata_backup=moodledata
-backup_type=rsync-link-dest-snapshot
+moodledata_backup=$(cfg host_dataroot).tar.gz
+backup_type=tar-gz-compressed
 git_commit=$CURRENT_COMMIT
 created_at=$BACKUPDATE
 EOF
@@ -595,8 +592,8 @@ Database:
 
 Backup contents:
   $(cfg host_htmlroot).tar.gz
-  ${IOMAD[dbname]}.sql.gz
-  moodledata/
+  ${IOMAD[dbname]}.sql
+  $(cfg host_dataroot).tar.gz
 
 Moodledata excluded directories:
   cache/
@@ -607,9 +604,8 @@ Moodledata excluded directories:
   lock/
 
 Notes:
-  moodledata is an rsync snapshot.
-  Unchanged files are hardlinked to the previous local backup when possible.
-  Do not manually edit or partially delete files inside snapshot folders unless you understand hardlinks.
+  moodledata is compressed as a tar.gz archive.
+  Runtime directories (cache, sessions, temp, etc.) are excluded.
 EOF
 }
 
@@ -635,7 +631,7 @@ backup_html() {
 
 backup_database() {
     echo
-    echo "- Dumping database into: ${B}${IOMAD[dbname]}.sql.gz${N}"
+    echo "- Dumping database into: ${B}${IOMAD[dbname]}.sql${N}"
 
     MYSQL_CNF="$(make_mysql_defaults_file)"
 
@@ -649,60 +645,44 @@ backup_database() {
         --create-options \
         --default-character-set=utf8mb4 \
         "${IOMAD[dbname]}" \
-        | "${COMPRESS_CMD[@]}" > "$ARCHIVE_PATH/${IOMAD[dbname]}.sql.gz"
+        > "$ARCHIVE_PATH/${IOMAD[dbname]}.sql"
 
     rm -f "$MYSQL_CNF"
     MYSQL_CNF=""
 }
 
-find_previous_backup() {
-    if [ ! -d "$ARCHIVE_BASE" ]; then
-        return 0
-    fi
+backup_moodledata_tar() {
+    local data_name
+    data_name="$(basename "$VHOST_DATAPATH")"
 
-    find "$ARCHIVE_BASE" \
-        -mindepth 1 \
-        -maxdepth 1 \
-        -type d \
-        ! -name "$(basename "$ARCHIVE_PATH")" \
-        | sort \
-        | tail -n 1
-}
-
-backup_moodledata_snapshot() {
     echo
-    echo "- Creating ${B}moodledata rsync snapshot${N}"
+    echo "- Creating ${B}${data_name}.tar.gz${N}"
 
-    local previous_backup
-    previous_backup="$(find_previous_backup || true)"
+    local data_size
+    data_size="$(du -sb "$VHOST_DATAPATH" | awk '{print $1}')"
 
-    # Convert to absolute path so rsync --link-dest resolves correctly
-    if [ -n "$previous_backup" ]; then
-        previous_backup="$(readlink -f "$previous_backup")"
-    fi
-
-    local link_dest_args=()
-
-    if [ -n "$previous_backup" ] && [ -d "$previous_backup/moodledata" ]; then
-        echo "- Previous moodledata snapshot found:"
-        echo "  $previous_backup/moodledata"
-        link_dest_args=(--link-dest="$previous_backup/moodledata")
+    if [ "$HAVE_PV" = "yes" ]; then
+        sudo tar -C "$VHOST_ROOTPATH" -cf - \
+            --exclude="$data_name/cache" \
+            --exclude="$data_name/localcache" \
+            --exclude="$data_name/sessions" \
+            --exclude="$data_name/temp" \
+            --exclude="$data_name/trashdir" \
+            --exclude="$data_name/lock" \
+            "$data_name" \
+            | pv -s "$data_size" \
+            | "${COMPRESS_CMD[@]}" > "$ARCHIVE_PATH/${data_name}.tar.gz"
     else
-        echo "- No previous moodledata snapshot found. This will be a full initial snapshot."
+        sudo tar -C "$VHOST_ROOTPATH" -cf - \
+            --exclude="$data_name/cache" \
+            --exclude="$data_name/localcache" \
+            --exclude="$data_name/sessions" \
+            --exclude="$data_name/temp" \
+            --exclude="$data_name/trashdir" \
+            --exclude="$data_name/lock" \
+            "$data_name" \
+            | "${COMPRESS_CMD[@]}" > "$ARCHIVE_PATH/${data_name}.tar.gz"
     fi
-
-    mkdir -p "$ARCHIVE_PATH/moodledata"
-
-    sudo rsync -aHAX --numeric-ids --delete --info=progress2 \
-        "${link_dest_args[@]}" \
-        --exclude='/cache/' \
-        --exclude='/localcache/' \
-        --exclude='/sessions/' \
-        --exclude='/temp/' \
-        --exclude='/trashdir/' \
-        --exclude='/lock/' \
-        "$VHOST_DATAPATH/" \
-        "$ARCHIVE_PATH/moodledata/"
 }
 
 git_update_if_requested() {
@@ -794,7 +774,7 @@ start_backup() {
     write_params_and_manifest
 
     backup_html
-    backup_moodledata_snapshot
+    backup_moodledata_tar
     backup_database
 
     git_update_if_requested
