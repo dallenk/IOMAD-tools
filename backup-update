@@ -719,14 +719,14 @@ sync_remote_tree() {
 
     echo
     echo "- Starting $label rsync"
-    echo "  Source: $ARCHIVE_BASE/"
-    echo "  Dest  : ${remote_user}@${remote_host}:${remote_path%/}/$host_dir/"
+    echo "  Source: $ARCHIVE_PATH/"
+    echo "  Dest  : ${remote_user}@${remote_host}:${remote_path%/}/"
 
     rsync -aHz --numeric-ids --info=progress2 \
         "${delete_args[@]}" \
         -e "$SSH_CMD" \
-        "$ARCHIVE_BASE/" \
-        "${remote_user}@${remote_host}:${remote_path%/}/$host_dir/"
+        "$ARCHIVE_PATH/" \
+        "${remote_user}@${remote_host}:${remote_path%/}/"
 }
 
 remote_rsyncs_if_requested() {
