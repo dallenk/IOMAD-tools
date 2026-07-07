@@ -517,6 +517,15 @@ enable_maintenance() {
     fi
 }
 
+disable_maintenance_if_set() {
+    if [ "$MAINTENANCE_SET" -eq 1 ] && [ "$(cfg enable_host)" = "yes" ]; then
+        echo
+        echo "- Disabling maintenance mode and restoring access"
+        sudo -u "$www_user" php "$VHOST_HTMLPATH/admin/cli/maintenance.php" --disable || true
+        MAINTENANCE_SET=0
+    fi
+}
+
 stop_moodle_cron_if_configured() {
     if [ "$(cfg stop_moodle_cron)" != "yes" ]; then
         echo "- Moodle cron stop disabled. Set stop_moodle_cron=yes and moodle_cron_service/moodle_cron_timer if wanted."
@@ -780,6 +789,8 @@ start_backup() {
     git_update_if_requested
 
     fix_archive_ownership
+
+    disable_maintenance_if_set
 
     remote_rsyncs_if_requested
 
