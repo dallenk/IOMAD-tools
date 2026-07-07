@@ -1,277 +1,809 @@
-#!/bin/bash
+#!/usr/bin/env bash
 ##################################################################################
-#   A quick way to create restorable backups for an IOMAD moodle installation    #
-#   There are probably 1000 better ways to do this, and my code skills are by    #
-#   no means good, but it works for me and creates almost automated              #
-#   Backups and restoral for my particular virtual host Apache installation      #
-#   with several IOMAD installations running multiple versions and branches      #
-#                                                                                #
-#   Glady accepting of all code contributions.. It's been 10+ years since I      #
-#   Wrote anything of use to anyone else or publicly available.                  #
-#   Next thing to do: Add options for scheduled cron backups                     #
-#                                                                                #
+# Optimized IOMAD / Moodle backup script
+#
+# Backup layout:
+#   archive_root/host/YYYYMMDD-HHMMSS-gitcommit/
+#     ├── html.tar.gz
+#     ├── moodledata/              <-- rsync snapshot, hardlinked to previous backup
+#     ├── database.sql.gz
+#     ├── PARAMS
+#     └── backup-manifest.txt
+#
+# Major changes from the old version:
+#   - Does NOT tar.gz the whole moodledata directory every time.
+#   - Excludes Moodle runtime directories:
+#       cache, localcache, sessions, temp, trashdir, lock
+#   - Uses rsync --link-dest for local incremental snapshots.
+#   - Uses pigz if available, gzip otherwise.
+#   - Uses safer mysqldump options for Moodle/IOMAD.
+#   - Does not print the database password.
+#   - Waits for remote rsync jobs instead of silently backgrounding them.
 ##################################################################################
-declare -A CFG          # init settings.cfg options array
-declare -A PARAMS       # init PARAMS array for restoral
-declare -A IOMAD        # init IOMAD config.php array for restoral
-B=$(tput bold)
-U=$(tput smul)
-N=$(tput sgr0)
-awk=$(which awk)
-sed=$(which sed)
-grep=$(which grep)
-mysql=$(which mysql)
-php=$(which php)
-script_path=$(pwd)/
-archive_root="$(pwd)/${CFG[archive_root]}"
-www_user=$(source /etc/apache2/envvars && echo "$APACHE_RUN_USER")
-clear
-#############################################################################
-if [[ "$EUID" = 0 ]]; then
-    echo "running as sudo or root"
+
+set -Eeuo pipefail
+
+declare -A CFG
+declare -A IOMAD
+
+##################################################################################
+# Colours / formatting
+##################################################################################
+
+if command -v tput >/dev/null 2>&1 && [ -t 1 ]; then
+    B="$(tput bold)"
+    U="$(tput smul)"
+    N="$(tput sgr0)"
+    CYAN="$(tput setaf 6)"
+    YELLOW="$(tput setaf 3)"
+    RED="$(tput setaf 1)"
+    GREEN="$(tput setaf 2)"
+    RESET="$(tput sgr0)"
 else
-    sudo -k # make sure to ask for password on next sudo
+    B=""
+    U=""
+    N=""
+    CYAN=""
+    YELLOW=""
+    RED=""
+    GREEN=""
+    RESET=""
+fi
+
+##################################################################################
+# Helpers
+##################################################################################
+
+die() {
+    echo "${RED}ERROR:${RESET} $*" >&2
+    exit 1
+}
+
+warn() {
+    echo "${YELLOW}WARNING:${RESET} $*" >&2
+}
+
+info() {
+    echo "${CYAN}$*${RESET}"
+}
+
+cfg() {
+    local key="$1"
+    local default="${2:-}"
+    printf '%s' "${CFG[$key]:-$default}"
+}
+
+line() {
+    printf '%*s\n' "${COLUMNS:-80}" '' | tr ' ' '-'
+}
+
+ask_yes_no() {
+    local prompt="$1"
+    local default="$2"
+    local answer
+
+    while true; do
+        read -r -p "${B}${prompt}:${N} [${default}] " answer
+        answer="${answer:-$default}"
+
+        case "$answer" in
+            yes|no)
+                printf '%s' "$answer"
+                return 0
+                ;;
+            *)
+                echo "Invalid - enter yes or no"
+                ;;
+        esac
+    done
+}
+
+ask_digits() {
+    local prompt="$1"
+    local default="$2"
+    local answer
+
+    while true; do
+        read -r -p "${B}${prompt}:${N} [${default}] " answer
+        answer="${answer:-$default}"
+
+        if [[ "$answer" =~ ^[0-9]+$ ]]; then
+            printf '%s' "$answer"
+            return 0
+        fi
+
+        echo "Invalid - digits only"
+    done
+}
+
+countdown() {
+    local minutes="$1"
+
+    if [ "$minutes" -le 0 ]; then
+        return 0
+    fi
+
+    local start
+    start="$(( $(date '+%s') + minutes * 60 ))"
+
+    while [ "$start" -ge "$(date +%s)" ]; do
+        local remaining
+        remaining="$(( start - $(date +%s) ))"
+        printf '%s\r' "$(date -u -d "@$remaining" +%H:%M:%S)"
+        sleep 0.5
+    done
+
+    echo
+}
+
+require_command() {
+    local cmd="$1"
+    command -v "$cmd" >/dev/null 2>&1 || die "Required command not found: $cmd"
+}
+
+read_settings() {
+    local file="$1"
+
+    [ -f "$file" ] || die "No settings.cfg found. Rename/modify settings.cfg.default to settings.cfg"
+
+    while IFS= read -r line_raw || [ -n "$line_raw" ]; do
+        # Remove Windows CR if present
+        line_raw="${line_raw%$'\r'}"
+
+        # Skip blanks and comments
+        [[ -z "$line_raw" ]] && continue
+        [[ "$line_raw" =~ ^[[:space:]]*# ]] && continue
+
+        if [[ "$line_raw" == *"="* ]]; then
+            local key="${line_raw%%=*}"
+            local value="${line_raw#*=}"
+
+            # Trim simple whitespace around key
+            key="$(echo "$key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+            CFG["$key"]="$value"
+        fi
+    done < "$file"
+}
+
+parse_iomad_config() {
+    local config_php="$1"
+
+    [ -f "$config_php" ] || die "IOMAD/Moodle config.php not found: $config_php"
+
+    local parsed
+    parsed="$(
+        php -r '
+            $file = $argv[1];
+            $txt = file_get_contents($file);
+
+            $keys = ["dbname", "dbuser", "dbpass", "dbhost", "dbport", "dataroot"];
+
+            foreach ($keys as $key) {
+                $pattern = "/\\\$CFG->" . preg_quote($key, "/") . "\\s*=\\s*([\"\\x27])(.+?)\\1\\s*;/s";
+                if (preg_match($pattern, $txt, $m)) {
+                    echo $key . "=" . $m[2] . PHP_EOL;
+                }
+            }
+        ' "$config_php"
+    )"
+
+    while IFS='=' read -r key value; do
+        [ -z "${key:-}" ] && continue
+        IOMAD["$key"]="$value"
+    done <<< "$parsed"
+
+    [ -n "${IOMAD[dbname]:-}" ] || die "Could not read dbname from $config_php"
+    [ -n "${IOMAD[dbuser]:-}" ] || die "Could not read dbuser from $config_php"
+    [ -n "${IOMAD[dbpass]:-}" ] || die "Could not read dbpass from $config_php"
+}
+
+make_mysql_defaults_file() {
+    local mysql_cnf
+    mysql_cnf="$(mktemp)"
+
+    chmod 600 "$mysql_cnf"
+
+    {
+        echo "[client]"
+        echo "user=${IOMAD[dbuser]}"
+        echo "password=${IOMAD[dbpass]}"
+
+        if [ -n "${IOMAD[dbhost]:-}" ]; then
+            echo "host=${IOMAD[dbhost]}"
+        fi
+
+        if [ -n "${IOMAD[dbport]:-}" ]; then
+            echo "port=${IOMAD[dbport]}"
+        fi
+    } > "$mysql_cnf"
+
+    printf '%s' "$mysql_cnf"
+}
+
+##################################################################################
+# Initial setup
+##################################################################################
+
+clear
+
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SETTINGS_FILE="$SCRIPT_PATH/settings.cfg"
+
+read_settings "$SETTINGS_FILE"
+
+# Defaults for optional settings
+CFG[enabled]="$(cfg enabled no)"
+CFG[auto_update]="$(cfg auto_update no)"
+CFG[rsync_enabled]="$(cfg rsync_enabled no)"
+CFG[rsyncsandbox_enabled]="$(cfg rsyncsandbox_enabled no)"
+CFG[delay_timer]="$(cfg delay_timer 0)"
+CFG[enable_host]="$(cfg enable_host yes)"
+CFG[host_htmlroot]="$(cfg host_htmlroot html)"
+CFG[host_dataroot]="$(cfg host_dataroot moodledata)"
+CFG[host_config]="$(cfg host_config config.php)"
+CFG[compression_level]="$(cfg compression_level 3)"
+CFG[stop_moodle_cron]="$(cfg stop_moodle_cron no)"
+CFG[rsync_delete_remote]="$(cfg rsync_delete_remote no)"
+
+[ "$(cfg enabled)" = "yes" ] || die "Script not enabled. Check settings.cfg: enabled=yes"
+
+require_command awk
+require_command sed
+require_command grep
+require_command find
+require_command sort
+require_command tail
+require_command du
+require_command tar
+require_command rsync
+require_command mysqldump
+require_command php
+require_command sudo
+require_command git
+
+if command -v pigz >/dev/null 2>&1; then
+    COMPRESS_CMD=(pigz "-$(cfg compression_level 3)")
+    COMPRESS_NAME="pigz -$(cfg compression_level 3)"
+else
+    COMPRESS_CMD=(gzip)
+    COMPRESS_NAME="gzip"
+    warn "pigz not found. Falling back to gzip. Install with: sudo apt install pigz"
+fi
+
+if command -v pv >/dev/null 2>&1; then
+    HAVE_PV="yes"
+else
+    HAVE_PV="no"
+    warn "pv not found. Progress bars will be skipped. Install with: sudo apt install pv"
+fi
+
+# Determine real user
+if [ "$EUID" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    CURRENT_USER="$SUDO_USER"
+else
+    CURRENT_USER="$(logname 2>/dev/null || whoami)"
+fi
+
+CURRENT_HOME="$(getent passwd "$CURRENT_USER" | cut -d: -f6)"
+export HOME="$CURRENT_HOME"
+
+# Apache user
+www_user="$(
+    bash -c 'source /etc/apache2/envvars >/dev/null 2>&1; echo "${APACHE_RUN_USER:-www-data}"'
+)"
+
+SSH_ID="$(cfg ssh_identity "$HOME/.ssh/id_firetrain")"
+SSH_CMD="ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ${SSH_ID}"
+
+##################################################################################
+# Sudo check
+##################################################################################
+
+if [ "$EUID" -eq 0 ]; then
+    echo "Running as root/sudo"
+else
+    sudo -k
+
     if sudo true; then
         echo "Password correct - sudo rights allowed"
     else
-        echo "Wrong password"
-        exit 1
+        die "Wrong password or no sudo access"
     fi
 fi
-#############################################################################
-# Read in the settings.cfg file, use an array to store
-if [ -f "settings.cfg" ]; then
-    while read line; do
-        case "$line" in \#*) continue ;; esac
-        if echo "$line" | grep -F = &>/dev/null
-        then
-            VARNAME=$(echo "$line" | cut -d '=' -f 1)
-            CFG["$VARNAME"]=$(echo "$line" | cut -d '=' -f 2-)
-        fi
-    done < settings.cfg
-else 
-    echo "No settings.cfg found - modify and rename settings.cfg.default to settings.cfg"
-fi
-#############################################################################
-function final_check() {
-if [ ${CFG[enabled]} == "no" ]; then
-    echo "script not enabled - no changes made."
-    echo "Check settings.cfg:  enabled="
-    exit
-fi
-}
-function countdown() {
-    start="$(( $(date '+%s') + $1 * 60))"
-    while [ $start -ge $(date +%s) ]; do
-        time="$(( $start - $(date +%s) ))"
-        printf '%s\r' "$(date -u -d "@$time" +%H:%M:%S)"
-        sleep 0.1
-    done
-}
-#############################################################################
 
-if [ "$(dpkg -l | awk '/pv/ {print }'|wc -l)" -ge 1 ]; then
- echo ''
+##################################################################################
+# Pick host
+##################################################################################
+
+WWW_ROOTDIR="$(cfg www_rootdir)"
+
+[ -n "$WWW_ROOTDIR" ] || die "settings.cfg missing: www_rootdir="
+[ -d "$WWW_ROOTDIR" ] || die "www_rootdir does not exist: $WWW_ROOTDIR"
+
+cd "$WWW_ROOTDIR"
+
+line
+echo "${B}${CYAN}Choose the IOMAD host to back up and/or upgrade:${RESET} enter number"
+line
+echo
+
+PS3="${YELLOW}Enter selection: ${RESET}"
+
+select host_dir in $(find . -maxdepth 1 -type d ! -name '.*' -printf '%P\n' | sort); do
+    if [[ -n "${host_dir:-}" ]]; then
+        break
+    else
+        echo "${RED}>>> Invalid Selection${RESET}"
+    fi
+done
+
+VHOST_ROOTPATH="${WWW_ROOTDIR%/}/$host_dir"
+VHOST_HTMLPATH="$VHOST_ROOTPATH/$(cfg host_htmlroot)"
+VHOST_DATAPATH="$VHOST_ROOTPATH/$(cfg host_dataroot)"
+IOMAD_PHP="$VHOST_HTMLPATH/$(cfg host_config)"
+
+[ -d "$VHOST_HTMLPATH" ] || die "HTML path not found: $VHOST_HTMLPATH"
+[ -f "$IOMAD_PHP" ] || die "IOMAD config file not found: $IOMAD_PHP"
+
+parse_iomad_config "$IOMAD_PHP"
+
+# Prefer dataroot from config.php if it exists
+if [ -n "${IOMAD[dataroot]:-}" ] && [ -d "${IOMAD[dataroot]}" ]; then
+    VHOST_DATAPATH="${IOMAD[dataroot]}"
+fi
+
+[ -d "$VHOST_DATAPATH" ] || die "Moodledata path not found: $VHOST_DATAPATH"
+
+BACKUPDATE="$(date +%Y%m%d-%H%M%S)"
+
+if git -C "$VHOST_HTMLPATH" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    CURRENT_COMMIT="$(git -C "$VHOST_HTMLPATH" log -1 --format=%h 2>/dev/null || echo nogit)"
 else
- echo '---------------------------------------------'
- echo '----          pv not installed           ----'
- echo '---- Please install pv before continuing ----'
- echo '----  PV is used to show a progress bar  ----'
- echo '---------------------------------------------'
- exit
-fi
-#############################################################################
-
-printf %"$COLUMNS"s | tr " " "-"
-printf "${B}Choose the IOMAD host to back-up and/or upgrade:${N} (number only)\n\n"
-cd ${CFG[www_rootdir]}
-select host_dir in *; do test -n $host_dir && break; echo ">>> Invalid Selection"; done
-VHOST_ROOTPATH=${CFG[www_rootdir]}/$host_dir/
-VHOST_HTMLPATH=${CFG[www_rootdir]}/$host_dir/${CFG[host_htmlroot]}
-VHOST_DATAPATH=${CFG[www_rootdir]}/$host_dir/${CFG[host_dataroot]}
-IOMAD_PHP=$VHOST_HTMLPATH/${CFG[host_config]}
-#######################################
-if [ ! -d "$VHOST_HTMLPATH" ]; then
-    echo "--------------------------------------------------"
-    echo "Path does not exist."
-    echo "The ${CFG[host_htmlroot]} directory was not found in:"
-    echo "-> ${B}${CFG[www_rootdir]}/$host_dir${N}"
-    echo
-    echo "Check paths, or script CFG.conf"
-    echo "--------------------------------------------------"
-    exit
+    CURRENT_COMMIT="nogit"
 fi
 
-if [ -f $IOMAD_PHP ]; then
-    IOMAD_dbname=$($grep -m1 dbname $IOMAD_PHP | cut -d\' -f 2);
-    IOMAD_dbuser=$($grep -m1 dbuser $IOMAD_PHP | cut -d\' -f 2);
-    IOMAD_dbpass=$($grep -m1 dbpass $IOMAD_PHP | cut -d\' -f 2);
-    IOMAD_dataroot=$($grep -m1 dataroot $IOMAD_PHP | cut -d\' -f 2);
-else
-    echo "IOMAD Configuration file not found"
-    echo "Check paths in CFG.cfg"
-    echo "Terminating script"
-    exit
-fi
-BACKUPDATE=$(date +%Y%m%d-%H%M%S)
-CURRENT_USER=$(logname)
-cd $VHOST_HTMLPATH
-GET_COMMIT=$(git log -1 --oneline)
-CURRENT_COMMIT=${GET_COMMIT:0:10}
-ARCHIVE_PATH="${CFG[archive_root]}/$host_dir/$BACKUPDATE-$CURRENT_COMMIT"
-####################################################################################################
-echo ""
-while true; do
-read -p "${B}Upgrade after backup? (yes/no):${N} [${CFG[auto_update]}] " AUTO_UPDATE
-    case $AUTO_UPDATE in
-        ""  ) break;;
-        yes ) break;;
-        no  ) break;;
-        *   ) echo invalid - yes/no;;
-    esac
-done
-CFG[auto_update]=${AUTO_UPDATE:-${CFG[auto_update]}}
-####################################################################################################
-while true; do
-read -p "${B}RSYNC to offsite location? (yes/no):${N} [${CFG[rsync_enabled]}] " RSYNC_ENABLED
-    case $RSYNC_ENABLED in 
-        ""  ) break;;
-        yes ) break;;
-        no  ) break;;
-        *   ) echo invalid - yes/no;;
-    esac
-done
-CFG[rsync_enabled]=${RSYNC_ENABLED:-${CFG[rsync_enabled]}}
-####################################################################################################
-echo ""
-echo "--------------------------------------------------"
-echo "---- Delay in minutes before script execution"
-echo "---- Press ENTER for default ${CFG[delay_timer]} minutes"
-echo "---- Enter 0 for immediate execution"
-echo "--------------------------------------------------"
-shopt -s extglob
-while true; do
-read -p "${B}Default delay timer is set, Enter new delay or <ENTER>:${N} [${CFG[delay_timer]}] " DELAY_TIMER
-    case ${DELAY_TIMER} in 
-        ""  ) break;;
-        +([[:digit:]])  ) break;;
-        *               ) echo invalid - Digits only;;
-    esac
-    done
-CFG[delay_timer]=${DELAY_TIMER:-${CFG[delay_timer]}}
+ARCHIVE_BASE="$(cfg archive_root)"
+[ -n "$ARCHIVE_BASE" ] || die "settings.cfg missing: archive_root="
 
-read -p "${B}Re-enable site after operation?:${N} [${CFG[enable_host]}] " ENABLE_HOST
-while true; do
-    case $ENABLE_HOST in 
-        ""  ) break;;
-        yes ) break;;
-        no  ) break;;
-        *   ) echo invalid - yes/no;;
-    esac
-done
-CFG[enable_host]=${ENABLE_HOST:-${CFG[enable_host]}}
-####################################################################################################
+ARCHIVE_BASE="${ARCHIVE_BASE%/}/$host_dir"
+ARCHIVE_PATH="$ARCHIVE_BASE/$BACKUPDATE-$CURRENT_COMMIT"
+
+##################################################################################
+# Interactive options
+##################################################################################
+
+echo
+CFG[auto_update]="$(ask_yes_no "Upgrade after backup? (yes/no)" "$(cfg auto_update)")"
+echo
+
+CFG[rsync_enabled]="$(ask_yes_no "RSYNC to offsite location? (yes/no)" "$(cfg rsync_enabled)")"
+echo
+
+CFG[rsyncsandbox_enabled]="$(ask_yes_no "RSYNC to sandbox location? (yes/no)" "$(cfg rsyncsandbox_enabled)")"
+echo
+
+line
+echo "Delay in minutes before script execution"
+echo "Press ENTER for default $(cfg delay_timer) minutes"
+echo "Enter 0 for immediate execution"
+line
+CFG[delay_timer]="$(ask_digits "Default delay timer is set, enter new delay or ENTER" "$(cfg delay_timer)")"
+echo
+
+CFG[enable_host]="$(ask_yes_no "Re-enable site after operation? (yes/no)" "$(cfg enable_host)")"
+echo
+
+##################################################################################
+# Summary
+##################################################################################
+
 clear
-printf %"$COLUMNS"s | tr " " "-"
+line
 echo "- ${B}General Options${N}"
-printf %"$COLUMNS"s | tr " " "-"
-echo "-- Update with git?       :   ${CFG[auto_update]}"
-echo "-- Delay timer            :   ${CFG[delay_timer]} minutes"
-echo "-- Re-enable host?        :   ${CFG[enable_host]}"
-echo "-- Webserver User         :   $www_user"
-echo "-- Host directory         :   $host_dir"
-echo "-- Script Path            :   $script_path"
-printf %"$COLUMNS"s | tr " " "-"
-echo "- ${B}Host options${N}"
-printf %"$COLUMNS"s | tr " " "-"
-echo "-- Webserver root path    :   ${CFG[www_rootdir]}"
-echo "-- Site path              :   $VHOST_ROOTPATH"
-echo "-- Site HTML path         :   $VHOST_HTMLPATH"
-echo "-- Site data path         :   $VHOST_DATAPATH"
-echo "-- Database Name          :   $IOMAD_dbname"
-echo "-- Database Username      :   $IOMAD_dbuser"
-echo "-- Database Password      :   $IOMAD_dbpass"
-echo "-- Archive folder         :   ${CFG[archive_root]}"
-echo "-- Archive path           :   $ARCHIVE_PATH"
-echo "-- Current User           :   $CURRENT_USER"
-printf %"$COLUMNS"s | tr " " "-"
-echo "- ${B}RSYNC options${N}"
-printf %"$COLUMNS"s | tr " " "-"
-echo "-- Use RSYNC?             :   ${CFG[rsync_enabled]}"
-echo "-- RSYNC Remote User      :   ${CFG[rsync_remoteuser]}"
-echo "-- RSYNC Remote Host      :   ${CFG[rsync_remotehost]}"
-echo "-- RSYNC Remote Path      :   ${CFG[rsync_remotepath]}"
-echo "-- RSYNC Full Path        :   ${CFG[rsync_remotepath]}/$host_dir"
-echo ""
-printf %"$COLUMNS"s | tr " " "-"
-echo "-  ${B}CTRL+C to abort, Press ENTER to continue${N}"
-printf %"$COLUMNS"s | tr " " "-"
-final_check
-read -p [ENTER]
-clear
-####################################################################################################
-function start () {
-cd $script_path
-	if [ ${CFG[delay_timer]} -eq 0 ]; then
-	enable="enable"
-	else
-	enable="enablelater=${CFG[delay_timer]}"
-	fi
-	echo - Setting offline warning for all users
-	sudo -u $www_user $php $VHOST_HTMLPATH/admin/cli/maintenance.php --$enable
-	countdown ${CFG[delay_timer]}
+line
+echo "-- Update with git?          :   $(cfg auto_update)"
+echo "-- Delay timer               :   $(cfg delay_timer) minutes"
+echo "-- Re-enable host?           :   $(cfg enable_host)"
+echo "-- Webserver user            :   $www_user"
+echo "-- Current user              :   $CURRENT_USER"
+echo "-- Host directory            :   $host_dir"
+echo "-- Script path               :   $SCRIPT_PATH"
+echo "-- Compression               :   $COMPRESS_NAME"
+echo "-- Stop Moodle cron?         :   $(cfg stop_moodle_cron)"
+line
+echo "- ${B}Host Options${N}"
+line
+echo "-- Webserver root path       :   $WWW_ROOTDIR"
+echo "-- Site path                 :   $VHOST_ROOTPATH"
+echo "-- Site HTML path            :   $VHOST_HTMLPATH"
+echo "-- Site data path            :   $VHOST_DATAPATH"
+echo "-- Database name             :   ${IOMAD[dbname]}"
+echo "-- Database username         :   ${IOMAD[dbuser]}"
+echo "-- Database host             :   ${IOMAD[dbhost]:-localhost/default}"
+echo "-- Archive base              :   $ARCHIVE_BASE"
+echo "-- Archive path              :   $ARCHIVE_PATH"
+line
+echo "- ${B}RSYNC Offsite Options${N}"
+line
+echo "-- RSYNC offsite?            :   $(cfg rsync_enabled)"
+echo "-- RSYNC remote user         :   $(cfg rsync_remoteuser)"
+echo "-- RSYNC remote host         :   $(cfg rsync_remotehost)"
+echo "-- RSYNC remote path         :   $(cfg rsync_remotepath)"
+echo "-- RSYNC full path           :   $(cfg rsync_remotepath)/$host_dir"
+line
+echo "- ${B}RSYNC Sandbox Options${N}"
+line
+echo "-- RSYNC to sandbox?         :   $(cfg rsyncsandbox_enabled)"
+echo "-- RSYNC sandbox user        :   $(cfg rsync_sandboxuser)"
+echo "-- RSYNC sandbox host        :   $(cfg rsync_sandboxhost)"
+echo "-- RSYNC sandbox path        :   $(cfg rsync_sandboxpath)"
+echo "-- RSYNC sandbox full path   :   $(cfg rsync_sandboxpath)/$host_dir"
+line
+echo
+echo "- ${B}CTRL+C to abort, press ENTER to continue${N}"
+line
+read -r
+
+##################################################################################
+# Cleanup handling
+##################################################################################
+
+MAINTENANCE_SET=0
+CRON_STOPPED=0
+MYSQL_CNF=""
+
+cleanup() {
+    local status=$?
+
+    if [ -n "${MYSQL_CNF:-}" ] && [ -f "$MYSQL_CNF" ]; then
+        rm -f "$MYSQL_CNF"
+    fi
+
+    if [ "$CRON_STOPPED" -eq 1 ]; then
+        echo "- Restarting configured Moodle cron services/timers"
+
+        if [ -n "$(cfg moodle_cron_service)" ]; then
+            sudo systemctl start "$(cfg moodle_cron_service)" 2>/dev/null || true
+        fi
+
+        if [ -n "$(cfg moodle_cron_timer)" ]; then
+            sudo systemctl start "$(cfg moodle_cron_timer)" 2>/dev/null || true
+        fi
+    fi
+
+    if [ "$MAINTENANCE_SET" -eq 1 ] && [ "$(cfg enable_host)" = "yes" ]; then
+        echo "- Disabling maintenance mode and restoring access"
+        sudo -u "$www_user" php "$VHOST_HTMLPATH/admin/cli/maintenance.php" --disable || true
+    elif [ "$MAINTENANCE_SET" -eq 1 ]; then
+        echo "${B}- Maintenance mode was left enabled by request -${N}"
+    fi
+
+    if [ "$status" -ne 0 ]; then
+        echo
+        echo "${RED}Backup script exited with errors.${RESET}"
+    fi
+
+    exit "$status"
+}
+
+trap cleanup EXIT
+
+##################################################################################
+# Backup functions
+##################################################################################
+
+enable_maintenance() {
+    local delay
+    delay="$(cfg delay_timer)"
+
+    cd "$SCRIPT_PATH"
+
+    if [ "$delay" -eq 0 ]; then
+        echo "- Setting site to maintenance mode immediately"
+        sudo -u "$www_user" php "$VHOST_HTMLPATH/admin/cli/maintenance.php" --enable
+    else
+        echo "- Setting maintenance mode warning for all users: enable in $delay minute(s)"
+        sudo -u "$www_user" php "$VHOST_HTMLPATH/admin/cli/maintenance.php" "--enablelater=$delay"
+        countdown "$delay"
+
+        echo "- Enabling maintenance mode now"
+        sudo -u "$www_user" php "$VHOST_HTMLPATH/admin/cli/maintenance.php" --enable
+    fi
+
+    MAINTENANCE_SET=1
 
     if [ -f "$VHOST_DATAPATH/climaintenance.html.off" ]; then
-        echo -  Setting custom offline page for all users
-        cp $VHOST_DATAPATH/climaintenance.html.off $VHOST_DATAPATH/climaintenance.html
-    fi	
-    printf %"$COLUMNS"s | tr " " "-"
-	sudo -u $CURRENT_USER mkdir -p $ARCHIVE_PATH
-    echo www_rootdir=${CFG[www_rootdir]} | sudo -u $www_user tee ${CFG[www_rootdir]}/$host_dir/PARAMS > /dev/null
-    echo www_hostdir=${CFG[www_rootdir]}/$host_dir | sudo -u $www_user tee -a ${CFG[www_rootdir]}/$host_dir/PARAMS > /dev/null
-	echo archive_root=${CFG[archive_root]} | sudo -u $www_user tee -a ${CFG[www_rootdir]}/$host_dir/PARAMS > /dev/null
-	echo archive_path=${CFG[archive_root]}/$host_dir | sudo -u $www_user tee -a ${CFG[www_rootdir]}/$host_dir/PARAMS > /dev/null
-	echo last_backup=$BACKUPDATE-$CURRENT_COMMIT | sudo -u $www_user tee -a ${CFG[www_rootdir]}/$host_dir/PARAMS > /dev/null
-    echo database_dump=$IOMAD_dbname.sql | sudo -u $www_user tee -a ${CFG[www_rootdir]}/$host_dir/PARAMS > /dev/null
-    echo
-	cd $VHOST_ROOTPATH
-	echo "- BEGINNING BACKUP OF PRODUCTION WEBSITE"
-	echo "- Creating ${B}${CFG[host_htmlroot]}.tar.gz${N}"
-	sudo -u $www_user tar cf - ./${CFG[host_htmlroot]} -P | pv -s $(du -sb ./${CFG[host_htmlroot]} | awk '{print $1}') | gzip > $script_path/$ARCHIVE_PATH/${CFG[host_htmlroot]}.tar.gz
-    echo
-	echo "- Creating ${B}${CFG[host_dataroot]}.tar.gz${N}"
-	sudo -u $www_user tar cf - ./${CFG[host_dataroot]} -P | pv -s $(du -sb ./${CFG[host_dataroot]} | awk '{print $1}') | gzip > $script_path/$ARCHIVE_PATH/${CFG[host_dataroot]}.tar.gz
-    echo
-    echo "- DUMPING DATABASE INTO: ${B}$IOMAD_dbname.sql${N} -"
-	mysqldump -u$IOMAD_dbuser -p$IOMAD_dbpass -C -Q -e --create-options $IOMAD_dbname > "$script_path/$ARCHIVE_PATH/$IOMAD_dbname.sql"
-	if [ ${CFG[auto_update]} == "yes" ]; then
-		cd $VHOST_HTMLPATH
-		echo - begining git pull -
-		sudo -u $www_user git pull
-	fi
-####################################################################################################
-    printf %"$COLUMNS"s | tr " " "-"
-    echo "- Changing ownership of backup files"
-	sudo chown -R $CURRENT_USER:$CURRENT_USER $script_path/$ARCHIVE_PATH
-	if [ ${CFG[rsync_enabled]} == "yes" ]; then
-    cd $script_path/$ARCHIVE_PATH/
-	echo "- Starting rsync and sending latest backup to remote server"
-	rsync -azhR ./* ${CFG[rsync_remoteuser]}@${CFG[rsync_remotehost]}:${CFG[rsync_remotepath]}/$host_dir &
-	echo "- Sending archive to remove server using rsync"
-	fi
-	if [ ${CFG[enable_host]} == "yes" ]; then
-        echo - Disable maintenance mode and restore access
-        sudo -u $www_user $php $VHOST_HTMLPATH/admin/cli/maintenance.php --disable
-    else
-        echo "${B}- Maintenance mode not disabled -${N}"
-	fi
-    printf %"$COLUMNS"s | tr " " "-"
-    echo
+        echo "- Setting custom offline page"
+        cp "$VHOST_DATAPATH/climaintenance.html.off" "$VHOST_DATAPATH/climaintenance.html"
+    fi
 }
-####################################################################################################
-if [ ${CFG[enabled]} == "yes" ]; then
-    start ${CFG[delay_timer]}
-else 
-    echo "Exited without execution - check settings.cfg for: enabled=${CFG[enabled]}"
-fi
-exit
+
+stop_moodle_cron_if_configured() {
+    if [ "$(cfg stop_moodle_cron)" != "yes" ]; then
+        echo "- Moodle cron stop disabled. Set stop_moodle_cron=yes and moodle_cron_service/moodle_cron_timer if wanted."
+        return 0
+    fi
+
+    local stopped_any=0
+
+    if [ -n "$(cfg moodle_cron_timer)" ]; then
+        echo "- Stopping Moodle cron timer: $(cfg moodle_cron_timer)"
+        sudo systemctl stop "$(cfg moodle_cron_timer)"
+        stopped_any=1
+    fi
+
+    if [ -n "$(cfg moodle_cron_service)" ]; then
+        echo "- Stopping Moodle cron service: $(cfg moodle_cron_service)"
+        sudo systemctl stop "$(cfg moodle_cron_service)" 2>/dev/null || true
+        stopped_any=1
+    fi
+
+    if [ "$stopped_any" -eq 1 ]; then
+        CRON_STOPPED=1
+    else
+        warn "stop_moodle_cron=yes, but no moodle_cron_service or moodle_cron_timer configured."
+    fi
+}
+
+make_archive_dirs() {
+    echo "- Creating archive path: $ARCHIVE_PATH"
+    sudo mkdir -p "$ARCHIVE_PATH"
+    sudo chown -R "$CURRENT_USER:$CURRENT_USER" "$ARCHIVE_BASE"
+}
+
+write_params_and_manifest() {
+    cat > "$ARCHIVE_PATH/PARAMS" <<EOF
+www_rootdir=$WWW_ROOTDIR
+www_hostdir=$VHOST_ROOTPATH
+html_path=$VHOST_HTMLPATH
+moodledata_path=$VHOST_DATAPATH
+archive_root=$(cfg archive_root)
+archive_base=$ARCHIVE_BASE
+archive_path=$ARCHIVE_PATH
+last_backup=$(basename "$ARCHIVE_PATH")
+database_dump=${IOMAD[dbname]}.sql.gz
+html_archive=$(cfg host_htmlroot).tar.gz
+moodledata_backup=moodledata
+backup_type=rsync-link-dest-snapshot
+git_commit=$CURRENT_COMMIT
+created_at=$BACKUPDATE
+EOF
+
+    cat > "$ARCHIVE_PATH/backup-manifest.txt" <<EOF
+IOMAD/Moodle backup manifest
+============================
+
+Host:
+  $host_dir
+
+Created:
+  $BACKUPDATE
+
+Git commit:
+  $CURRENT_COMMIT
+
+HTML path:
+  $VHOST_HTMLPATH
+
+Moodledata path:
+  $VHOST_DATAPATH
+
+Database:
+  ${IOMAD[dbname]}
+
+Backup contents:
+  $(cfg host_htmlroot).tar.gz
+  ${IOMAD[dbname]}.sql.gz
+  moodledata/
+
+Moodledata excluded directories:
+  cache/
+  localcache/
+  sessions/
+  temp/
+  trashdir/
+  lock/
+
+Notes:
+  moodledata is an rsync snapshot.
+  Unchanged files are hardlinked to the previous local backup when possible.
+  Do not manually edit or partially delete files inside snapshot folders unless you understand hardlinks.
+EOF
+}
+
+backup_html() {
+    local html_name
+    html_name="$(basename "$VHOST_HTMLPATH")"
+
+    echo
+    echo "- Creating ${B}${html_name}.tar.gz${N}"
+
+    local html_size
+    html_size="$(du -sb "$VHOST_HTMLPATH" | awk '{print $1}')"
+
+    if [ "$HAVE_PV" = "yes" ]; then
+        sudo tar -C "$VHOST_ROOTPATH" -cf - "$html_name" \
+            | pv -s "$html_size" \
+            | "${COMPRESS_CMD[@]}" > "$ARCHIVE_PATH/${html_name}.tar.gz"
+    else
+        sudo tar -C "$VHOST_ROOTPATH" -cf - "$html_name" \
+            | "${COMPRESS_CMD[@]}" > "$ARCHIVE_PATH/${html_name}.tar.gz"
+    fi
+}
+
+backup_database() {
+    echo
+    echo "- Dumping database into: ${B}${IOMAD[dbname]}.sql.gz${N}"
+
+    MYSQL_CNF="$(make_mysql_defaults_file)"
+
+    mysqldump \
+        --defaults-extra-file="$MYSQL_CNF" \
+        --single-transaction \
+        --quick \
+        --routines \
+        --triggers \
+        --events \
+        --create-options \
+        --default-character-set=utf8mb4 \
+        "${IOMAD[dbname]}" \
+        | "${COMPRESS_CMD[@]}" > "$ARCHIVE_PATH/${IOMAD[dbname]}.sql.gz"
+
+    rm -f "$MYSQL_CNF"
+    MYSQL_CNF=""
+}
+
+find_previous_backup() {
+    if [ ! -d "$ARCHIVE_BASE" ]; then
+        return 0
+    fi
+
+    find "$ARCHIVE_BASE" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -type d \
+        ! -name "$(basename "$ARCHIVE_PATH")" \
+        | sort \
+        | tail -n 1
+}
+
+backup_moodledata_snapshot() {
+    echo
+    echo "- Creating ${B}moodledata rsync snapshot${N}"
+
+    local previous_backup
+    previous_backup="$(find_previous_backup || true)"
+
+    local link_dest_args=()
+
+    if [ -n "$previous_backup" ] && [ -d "$previous_backup/moodledata" ]; then
+        echo "- Previous moodledata snapshot found:"
+        echo "  $previous_backup/moodledata"
+        link_dest_args=(--link-dest="$previous_backup/moodledata")
+    else
+        echo "- No previous moodledata snapshot found. This will be a full initial snapshot."
+    fi
+
+    mkdir -p "$ARCHIVE_PATH/moodledata"
+
+    sudo rsync -aHAX --numeric-ids --delete --info=progress2 \
+        "${link_dest_args[@]}" \
+        --exclude='/cache/' \
+        --exclude='/localcache/' \
+        --exclude='/sessions/' \
+        --exclude='/temp/' \
+        --exclude='/trashdir/' \
+        --exclude='/lock/' \
+        "$VHOST_DATAPATH/" \
+        "$ARCHIVE_PATH/moodledata/"
+}
+
+git_update_if_requested() {
+    if [ "$(cfg auto_update)" = "yes" ]; then
+        echo
+        echo "- Beginning git pull"
+        sudo -u "$www_user" git -C "$VHOST_HTMLPATH" pull
+    fi
+}
+
+sync_remote_tree() {
+    local label="$1"
+    local remote_user="$2"
+    local remote_host="$3"
+    local remote_path="$4"
+
+    [ -n "$remote_user" ] || die "$label rsync user is empty"
+    [ -n "$remote_host" ] || die "$label rsync host is empty"
+    [ -n "$remote_path" ] || die "$label rsync path is empty"
+
+    local delete_args=()
+    if [ "$(cfg rsync_delete_remote)" = "yes" ]; then
+        delete_args=(--delete)
+    fi
+
+    echo
+    echo "- Starting $label rsync"
+    echo "  Source: $ARCHIVE_BASE/"
+    echo "  Dest  : ${remote_user}@${remote_host}:${remote_path%/}/$host_dir/"
+
+    rsync -aHz --numeric-ids --info=progress2 \
+        "${delete_args[@]}" \
+        -e "$SSH_CMD" \
+        "$ARCHIVE_BASE/" \
+        "${remote_user}@${remote_host}:${remote_path%/}/$host_dir/"
+}
+
+remote_rsyncs_if_requested() {
+    local pids=()
+
+    if [ "$(cfg rsync_enabled)" = "yes" ]; then
+        sync_remote_tree \
+            "offsite" \
+            "$(cfg rsync_remoteuser)" \
+            "$(cfg rsync_remotehost)" \
+            "$(cfg rsync_remotepath)" &
+        pids+=("$!")
+    fi
+
+    if [ "$(cfg rsyncsandbox_enabled)" = "yes" ]; then
+        sync_remote_tree \
+            "sandbox" \
+            "$(cfg rsync_sandboxuser)" \
+            "$(cfg rsync_sandboxhost)" \
+            "$(cfg rsync_sandboxpath)" &
+        pids+=("$!")
+    fi
+
+    if [ "${#pids[@]}" -gt 0 ]; then
+        echo
+        echo "- Waiting for rsync job(s) to complete"
+
+        local pid
+        for pid in "${pids[@]}"; do
+            wait "$pid"
+        done
+    fi
+}
+
+fix_archive_ownership() {
+    echo
+    echo "- Changing ownership of backup files"
+    sudo chown -R "$CURRENT_USER:$CURRENT_USER" "$ARCHIVE_PATH"
+}
+
+##################################################################################
+# Main
+##################################################################################
+
+start_backup() {
+    clear
+    line
+    echo "- BEGINNING BACKUP OF PRODUCTION WEBSITE"
+    line
+
+    enable_maintenance
+    stop_moodle_cron_if_configured
+    make_archive_dirs
+    write_params_and_manifest
+
+    backup_html
+    backup_moodledata_snapshot
+    backup_database
+
+    git_update_if_requested
+
+    fix_archive_ownership
+
+    remote_rsyncs_if_requested
+
+    line
+    echo "${GREEN}- Backup completed successfully${RESET}"
+    echo "- Archive path:"
+    echo "  $ARCHIVE_PATH"
+    line
+}
+
+start_backup
+
+exit 0

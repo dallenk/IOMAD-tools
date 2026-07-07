@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ===== Config =====
+DB_HOST="${DB_HOST:-localhost}"
+DB_NAME="${DB_NAME:-db_firetrain_ca}"
+DB_USER="${DB_USER:-usr_firetrain_ca}"
+DB_PASS="${DB_PASS:-utf8mb4_unicode_ci}"
+
+# Change from roleid=12 to roleid=13 (override with env if needed)
+FROM_ROLE="${FROM_ROLE:-12}"
+TO_ROLE="${TO_ROLE:-13}"
+
+# Moodle cache purge script
+PURGE_CACHES="${PURGE_CACHES:-/var/www/vhosts/firetrain.ca/iomad/admin/cli/purge_caches.php}"
+
+# ===== Colors =====
+GRN=$'\e[32m'
+YEL=$'\e[33m'
+BLD=$'\e[1m'
+RST=$'\e[0m'
+
+# ===== Helpers =====
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+mysqlq() {
+  mysql -h"$DB_HOST" -u"$DB_USER" -p"$DB_PASS" -D "$DB_NAME" -N -B -e "$1"
+}
+
+expand_ids() {
+  awk '
+    function add(x){ if(!(x in seen)){ seen[x]=1; out[++n]=x } }
+    {
+      for(i=1;i<=NF;i++){
+        if($i=="") continue
+        if($i ~ /^[0-9]+-[0-9]+$/){
+          split($i,a,"-"); s=a[1]+0; e=a[2]+0
+          if(s<=e){ for(j=s;j<=e;j++) add(j) } else { for(j=s;j>=e;j--) add(j) }
+        } else if($i ~ /^[0-9]+$/){
+          add($i+0)
+        }
+      }
+    }
+    END{
+      asort(out)
+      for(i=1;i<=n;i++) printf("%s%s", out[i], (i<n?" ":""))
+    }
+  '
+}
+
+get_course_name() {
+  local cid="$1"
+  mysqlq "SELECT fullname FROM mdl_course WHERE id=$cid LIMIT 1;"
+}
+
+# Return "1" if course exists, else "0"
+course_exists() {
+  local cid="$1"
+  local n
+  n="$(mysqlq "SELECT COUNT(*) FROM mdl_course WHERE id=$cid;")" || echo 0
+  [[ "$n" -gt 0 ]] && echo 1 || echo 0
+}
+
+# Filter a space-separated list of IDs to only those that exist
+filter_existing_ids() {
+  local all=($@)
+  local kept=()
+  for cid in "${all[@]}"; do
+    if [[ "$(course_exists "$cid")" == "1" ]]; then
+      kept+=("$cid")
+    fi
+  done
+  echo "${kept[*]}"
+}
+
+print_courses_only() {
+  echo "=== Courses (choose by ID) ==="
+  printf "%-5s %-20s %-64s\n" "ID" "Shortname" "Fullname"
+  mysqlq "SELECT id, shortname, fullname FROM mdl_course ORDER BY id;" \
+    | awk -F'\t' '{ printf "%-5s %-20s %-64s\n", $1, $2, $3 }'
+  echo
+}
+
+# Get the shortname for a given role id (e.g., 12 -> companycourseeditor)
+get_role_shortname_by_id() {
+  local rid="$1"
+  mysqlq "SELECT shortname FROM mdl_role WHERE id=$rid LIMIT 1;"
+}
+
+# Role counts matrix: columns = role shortnames; color FROM_ROLE counts green
+print_role_counts_matrix() {
+  local ids=("$@")
+  local in_list
+  in_list="$(printf "%s," "${ids[@]}" | sed 's/,$//')"
+
+  # Distinct role shortnames present across the selected courses
+  mapfile -t ROLES < <( mysqlq "
+    SELECT DISTINCT r.shortname
+    FROM mdl_role_assignments ra
+    JOIN mdl_role r      ON r.id = ra.roleid
+    JOIN mdl_context ctx ON ctx.id = ra.contextid
+    WHERE ctx.contextlevel = 50
+      AND ctx.instanceid IN ($in_list)
+    ORDER BY r.shortname;
+  " )
+
+  echo "=== Role Counts for selected courses ==="
+
+  if [[ ${#ROLES[@]} -eq 0 ]]; then
+    echo "(No role assignments found for the selected courses.)"
+    echo
+    return 0
+  fi
+
+  local FROM_ROLE_NAME
+  FROM_ROLE_NAME="$(get_role_shortname_by_id "$FROM_ROLE")"
+
+  {
+    # Header (TSV)
+    printf "CourseID\tCourseName"
+    for r in "${ROLES[@]}"; do printf "\t%s" "$r"; done
+    printf "\n"
+
+    # Rows (TSV)
+    for cid in "${ids[@]}"; do
+      [[ "$(course_exists "$cid")" != "1" ]] && continue
+      local cname; cname="$(get_course_name "$cid")"
+
+      declare -A CNT=()
+      while IFS=$'\t' read -r rname cnt; do
+        CNT["$rname"]="$cnt"
+      done < <( mysqlq "
+        SELECT r.shortname, COUNT(*) AS cnt
+        FROM mdl_role_assignments ra
+        JOIN mdl_role r      ON r.id = ra.roleid
+        JOIN mdl_context ctx ON ctx.id = ra.contextid
+        WHERE ctx.contextlevel = 50
+          AND ctx.instanceid = $cid
+        GROUP BY r.shortname;
+      " )
+
+      printf "%s\t%s" "$cid" "$cname"
+      for r in "${ROLES[@]}"; do
+        printf "\t%s" "${CNT[$r]:-0}"
+      done
+      printf "\n"
+
+      unset CNT
+      declare -A CNT=()
+    done
+  } \
+  | awk -F'\t' -v OFS='\t' -v GRN="$GRN" -v RST="$RST" \
+        -v tgt="$FROM_ROLE_NAME" -v editor="companycourseeditor" '
+      NR==1 {
+        for (i=1; i<=NF; i++) {
+          if ($i == tgt)    tgtcol=i
+          if ($i == editor) edcol=i
+        }
+        print; next
+      }
+      {
+        if (edcol && $edcol != "0") $2 = GRN $2 RST
+        if (tgtcol && $tgtcol != "0") $tgtcol = GRN $tgtcol RST
+        print
+      }
+    ' \
+  | column -t -s $'\t'
+
+  echo
+}
+# Consolidated table of users that WILL be changed (roleid=FROM_ROLE), auto-aligned, green rows
+print_pending_changes_table() {
+  local ids=("$@")
+  {
+    echo -e "CID\tCoursename\tUID\tUsername\tFirst\tLast\tRole\tRolename"
+    local n=${#ids[@]}
+    for i in "${!ids[@]}"; do
+      local cid="${ids[$i]}"
+      [[ "$(course_exists "$cid")" != "1" ]] && continue
+
+      local had_rows=0
+      while IFS=$'\t' read -r ccid cname uid uname fname lname rid rname; do
+        had_rows=1
+        echo -e "${ccid}\t${cname}\t${uid}\t${uname}\t${fname}\t${lname}\t${rid}\t${rname}"
+      done < <( mysqlq "
+        SELECT c.id, c.fullname, u.id, u.username, u.firstname, u.lastname, r.id, r.shortname
+        FROM mdl_role_assignments ra
+        JOIN mdl_user u      ON u.id = ra.userid
+        JOIN mdl_role r      ON r.id = ra.roleid
+        JOIN mdl_context ctx ON ctx.id = ra.contextid
+        JOIN mdl_course c    ON c.id = ctx.instanceid
+        WHERE ctx.contextlevel = 50
+          AND c.id = $cid
+          AND ra.roleid = $FROM_ROLE
+        ORDER BY c.id, u.lastname, u.firstname;
+      " )
+
+      # Separator only if this course had rows AND it's not the last course
+      if [[ "$had_rows" -eq 1 && "$i" -lt $((n-1)) ]]; then
+        echo -e "-----\t-----\t-----\t-----\t-----\t-----\t-----\t-----"
+      fi
+    done
+  } | column -t -s $'\t' | awk -v GRN="$GRN" -v RST="$RST" '
+        NR==1 { print; next }          # header stays plain
+        /^-----/ { print; next }       # separator stays plain
+        { print GRN $0 RST }           # data rows green
+      '
+  echo
+}
+
+# AFTER snapshot: users who now have TO_ROLE in the course (yellow rows), auto-aligned
+show_after_snapshot_yellow() {
+  local cid="$1"
+  [[ "$(course_exists "$cid")" != "1" ]] && return 0
+  local cname; cname="$(get_course_name "$cid")"
+  echo "---- AFTER for course ${cid} (${cname}) (roleid=${TO_ROLE}) ----"
+  {
+    echo -e "UID\tUsername\tFirst\tLast\tRole(shortname)"
+    mysqlq "
+      SELECT u.id, u.username, u.firstname, u.lastname, r.shortname
+      FROM mdl_role_assignments ra
+      JOIN mdl_user u ON u.id = ra.userid
+      JOIN mdl_role r ON r.id = ra.roleid
+      WHERE ra.roleid = $TO_ROLE
+        AND ra.contextid = (
+          SELECT id FROM mdl_context WHERE contextlevel=50 AND instanceid=$cid
+        )
+      ORDER BY u.lastname, u.firstname;
+    " | while IFS=$'\t' read -r uid uname fname lname rname; do
+          echo -e "${uid}\t${uname}\t${fname}\t${lname}\t${rname}"
+        done
+  } | column -t -s $'\t' | awk -v YEL="$YEL" -v RST="$RST" '
+        NR==1 { print; next }    # header uncolored
+        { print YEL $0 RST }     # data rows yellow
+      '
+  echo
+}
+
+do_update_course() {
+  local cid="$1"
+  mysqlq "
+    UPDATE mdl_role_assignments
+       SET roleid = $TO_ROLE
+     WHERE roleid = $FROM_ROLE
+       AND contextid = (
+         SELECT id FROM mdl_context WHERE contextlevel=50 AND instanceid=$cid
+       );
+    SELECT ROW_COUNT() AS rows_changed;
+  "
+}
+
+# ===== Sanity checks (once) =====
+if [[ "$(id -u)" -ne 0 ]]; then
+  die "Please run with sudo/root (needed to run cache purge as www-data)."
+fi
+command -v mysql >/dev/null 2>&1 || die "mysql client not found."
+command -v sudo  >/dev/null 2>&1 || die "sudo not found."
+[[ -f "$PURGE_CACHES" ]] || die "Purge script not found at: $PURGE_CACHES"
+id -u www-data >/dev/null 2>&1 || die "User www-data not found."
+mysqlq "SELECT 1;" >/dev/null 2>&1 || die "Cannot connect to MySQL."
+
+# ===== Main loop =====
+while true; do
+  # 1) Courses
+  print_courses_only
+
+  # 2) IDs or exit
+  read -r -p "Enter course ID(s) or ranges (e.g., 80,85,90-95) or X to exit: " RAW
+  case "${RAW,,}" in
+    x|exit) echo "Bye."; exit 0 ;;
+  esac
+  [[ -z "$RAW" ]] && { echo "No input given."; continue; }
+
+  IDS_RAW_LIST="$(printf '%s\n' "$RAW" | tr ',' ' ' | expand_ids)"
+  [[ -z "$IDS_RAW_LIST" ]] && { echo "No valid IDs parsed."; continue; }
+
+  IDS="$(filter_existing_ids $IDS_RAW_LIST)"
+  if [[ -z "$IDS" ]]; then
+    echo "No existing courses found in: $IDS_RAW_LIST  (nothing to do)"
+    echo
+    continue
+  fi
+
+  # Notice about skipped IDs (if any)
+  SKIPPED=()
+  for cid in $IDS_RAW_LIST; do
+    if [[ "$(course_exists "$cid")" != "1" ]]; then
+      SKIPPED+=("$cid")
+    fi
+  done
+  if [[ ${#SKIPPED[@]} -gt 0 ]]; then
+    echo "Skipped non-existent IDs: ${SKIPPED[*]}"
+  fi
+
+  echo "Selected existing course IDs: $IDS"
+  echo
+
+  # 3) Role counts matrix for selected courses (columns = roles)
+  print_role_counts_matrix $IDS
+
+  # 4) Consolidated WILL-CHANGE table (only FROM_ROLE users, green; separators only when a course has matches)
+  print_pending_changes_table $IDS
+
+  # 5) Proceed?
+  read -r -p "Proceed with updates? [Y=update / N=reselect / X=exit]: " ans
+  case "${ans,,}" in
+    y|yes)
+      echo
+      echo "Applying updates (roleid $FROM_ROLE → $TO_ROLE)…"
+      total_changed=0
+      for cid in $IDS; do
+        echo "Course $cid:"
+        changed="$(do_update_course "$cid" | awk '/rows_changed/ {next} {print $1}' | tail -n1)"
+        [[ -z "$changed" ]] && changed=0
+        printf "  rows_changed: %s\n" "$changed"
+        total_changed=$(( total_changed + changed ))
+      done
+
+      # AFTER snapshot (only TO_ROLE, yellow)
+      for cid in $IDS; do
+        show_after_snapshot_yellow "$cid"
+      done
+
+      echo
+      echo "Purging Moodle caches as www-data..."
+      sudo -u www-data php "$PURGE_CACHES"
+
+      echo
+      echo "Summary: total rows changed = $total_changed"
+      echo
+      ;;
+    x|exit)
+      echo "Bye."
+      exit 0
+      ;;
+    n|no|*)
+      echo "Okay — start over."
+      echo
+      continue
+      ;;
+  esac
+done

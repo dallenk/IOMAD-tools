@@ -1,0 +1,7 @@
+[1mChoose the IOMAD host to back up:(B[m (number only)
+
+1) 001-dev.firetrain.ca
+2) firetrain.ca
+3) media.firetrain.ca
+#? [1mUpgrade after backup? (yes/no):(B[m [no] [1mRSYNC to offsite location? (yes/no):(B[m [no] [1mRSYNC to sandbox location? (yes/no):(B[m [] ./backup-update: line 149: syntax error near unexpected token `fi'
+./backup-update: line 149: `fi'

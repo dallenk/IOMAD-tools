@@ -1,0 +1,7 @@
+[1mChoose the IOMAD host to back up:(B[m (number only)
+
+1) 001-dev.firetrain.ca
+2) IOMAD_BACKUPS
+3) firetrain.ca
+4) media.firetrain.ca
+#? [1mUpgrade after backup? (yes/no):(B[m [no] [1mRSYNC to offsite location? (yes/no):(B[m [no] [1mRSYNC to sandbox location? (yes/no):(B[m [no] Backup script is disabled in settings.cfg
